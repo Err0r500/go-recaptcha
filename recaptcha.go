@@ -2,64 +2,101 @@
 //
 // This package is designed to be called from within an HTTP server or web framework
 // which offers reCaptcha form inputs and requires them to be evaluated for correctness
-//
-// Edit the recaptchaPrivateKey constant before building and using
+
 package recaptcha
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
-	"log"
 	"net/http"
 	"net/url"
 	"time"
 )
 
-type RecaptchaResponse struct {
+type RecaptchaBridge struct {
+	KeyGetter
+	address string
+}
+
+type KeyGetter interface {
+	getSecretKey() (string, error)
+}
+
+type recaptchaResponse struct {
 	Success     bool      `json:"success"`
 	ChallengeTS time.Time `json:"challenge_ts"`
 	Hostname    string    `json:"hostname"`
 	ErrorCodes  []int     `json:"error-codes"`
 }
 
-const recaptchaServerName = "https://www.google.com/recaptcha/api/siteverify"
-
-var recaptchaPrivateKey string
-
-// check uses the client ip address, the challenge code from the reCaptcha form,
-// and the client's response input to that challenge to determine whether or not
-// the client answered the reCaptcha input question correctly.
-// It returns a boolean value indicating whether or not the client answered correctly.
-func check(remoteip, response string) (r RecaptchaResponse) {
-	resp, err := http.PostForm(recaptchaServerName,
-		url.Values{"secret": {recaptchaPrivateKey}, "remoteip": {remoteip}, "response": {response}})
-	if err != nil {
-		log.Printf("Post error: %s\n", err)
+func NewRecaptchaBridge(kG KeyGetter, address ...string) *RecaptchaBridge {
+	rB := RecaptchaBridge{KeyGetter: kG}
+	if len(address) == 0 {
+		rB.address = "https://www.google.com/recaptcha/api/siteverify"
 	}
+	if len(address) > 1 {
+		return nil
+	}
+	return &rB
+}
+
+// Confirm is the public facade.
+// Pass it the response and optionnally the client IP
+/*
+USAGE :
+rB := NewRecaptchaBridge(simpleGetter{})
+ok, err := Confirm(response, remoteip)
+if err != nil {
+	-> the validation process encountered a technical issue
+}
+if ok {
+	-> the response to the callenge is fine
+}
+*/
+func (rB *RecaptchaBridge) Confirm(response string, remoteip ...string) (ok bool, err error) {
+	query, err := rB.setupQuery(response, remoteip)
+	if err := checkReturn("rB.setupQuery()", query, err); err != nil {
+		return false, err
+	}
+
+	attempt, err := rB.check(query)
+	if err = checkReturn("rB.check()", attempt, err); err != nil {
+		return false, err
+	}
+	return attempt.Success, nil
+}
+
+func (rB *RecaptchaBridge) check(req *url.Values) (r *recaptchaResponse, err error) {
+	resp, err := http.PostForm(rB.address, *req)
+	if err = checkReturn("http.PostForm()", resp, err); err != nil {
+		return nil, err
+	}
+
 	defer resp.Body.Close()
 	body, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		log.Println("Read error: could not read body: %s", err)
+		return nil, err
 	}
-	err = json.Unmarshal(body, &r)
+
+	r = &recaptchaResponse{Success: false}
+	if err := r.fromJSON(body); err != nil {
+		return nil, err
+	}
+
+	return r, nil
+}
+
+func (r *recaptchaResponse) fromJSON(body []byte) error {
+	return json.Unmarshal(body, r)
+}
+
+func checkReturn(funcName string, resp interface{}, err error) error {
 	if err != nil {
-		log.Println("Read error: got invalid JSON: %s", err)
+		return err
 	}
-	return
-}
-
-// Confirm is the public interface function.
-// It calls check, which the client ip address, the challenge code from the reCaptcha form,
-// and the client's response input to that challenge to determine whether or not
-// the client answered the reCaptcha input question correctly.
-// It returns a boolean value indicating whether or not the client answered correctly.
-func Confirm(remoteip, response string) (result bool) {
-	result = check(remoteip, response).Success
-	return
-}
-
-// Init allows the webserver or code evaluating the reCaptcha form input to set the
-// reCaptcha private key (string) value, which will be different for every domain.
-func Init(key string) {
-	recaptchaPrivateKey = key
+	if resp == nil {
+		return fmt.Errorf("%s returned a nil pointer", funcName)
+	}
+	return nil
 }
